@@ -1,13 +1,15 @@
 (function () {
 'use strict';
 /* ============================================================
- * 排行榜 · 本地独立版
- * 分数与昵称全部保存在浏览器 localStorage，不依赖任何云端服务。
+ * 排行榜 · 云端共享版
+ * 分数与昵称写入 Cloudflare Workers KV（云端共享，跨设备/浏览器可见），
+ * 云端不可用时自动回退到浏览器 localStorage 离线缓存。
  * API 与原版 window.DanaiwaBoard 完全一致：
  *   open / close / refresh / onGameOver / fetchTop / submitScore
  *   myName / setName / hasName
  * ============================================================ */
 
+const API_BASE = 'https://fruit-board.wangyf-harry.workers.dev';
 const STORE_KEY = 'danaiwa.board.local.v1';
 const NAME_KEY = 'danaiwa.nick.v1';
 const MUTE_MIN_GAP = 3000;
@@ -16,9 +18,36 @@ const MAX_RECORDS = 20;      // 只保留最近 20 次提交
 
 const $ = (id) => document.getElementById(id);
 
-/* ---------- 本地数据层 ---------- */
+/* ---------- 云端 API 层 ---------- */
 
-function readAll() {
+function apiTop() {
+  return fetch(API_BASE + '/top', { method: 'GET', headers: { 'Accept': 'application/json' } })
+    .then(function (res) {
+      if (!res.ok) throw new Error('bad status ' + res.status);
+      return res.json();
+    })
+    .then(function (arr) { return Array.isArray(arr) ? arr : []; });
+}
+
+function apiSubmit(name, score) {
+  return fetch(API_BASE + '/submit', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ name: String(name || '').slice(0, 12), score: Number(score) || 0 })
+  })
+    .then(function (res) {
+      if (!res.ok) throw new Error('bad status ' + res.status);
+      return res.json();
+    })
+    .then(function (j) {
+      if (!j || j.ok !== true || !j.rec) throw new Error('bad submit');
+      return j.rec;
+    });
+}
+
+/* ---------- 本地离线缓存层 ---------- */
+
+function localReadAll() {
   try {
     const raw = localStorage.getItem(STORE_KEY);
     const arr = raw ? JSON.parse(raw) : [];
@@ -26,26 +55,20 @@ function readAll() {
   } catch (e) { return []; }
 }
 
-function writeAll(arr) {
+function localWriteAll(arr) {
   try { localStorage.setItem(STORE_KEY, JSON.stringify(arr)); } catch (e) { }
 }
 
-function addScore(name, score) {
-  const rec = {
-    tag: 'local_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 6),
-    name: String(name || DEFAULT_NAME).slice(0, 12),
-    score: Number(score) || 0,
-    t: Date.now()
-  };
-  const arr = readAll();
+function localAddRec(rec) {
+  const arr = localReadAll();
   arr.push(rec);
   arr.sort((a, b) => (b.t - a.t) || (a.tag > b.tag ? 1 : -1));
-  writeAll(arr.slice(0, MAX_RECORDS));
-  return Promise.resolve(rec);
+  localWriteAll(arr.slice(0, MAX_RECORDS));
+  return rec;
 }
 
-function fetchTop() {
-  const arr = readAll();
+function localTop() {
+  const arr = localReadAll();
   const rows = [];
   for (let i = 0; i < arr.length; i++) {
     const r = arr[i];
@@ -58,7 +81,46 @@ function fetchTop() {
   rows.sort((a, b) => (b.t - a.t) || (b.tag > a.tag ? 1 : -1));
   const fresh = rows.slice(0, MAX_RECORDS);
   fresh.sort((a, b) => (b.score - a.score) || (b.t - a.t));
-  return Promise.resolve(fresh);
+  return fresh;
+}
+
+/* ---------- 数据层（云端优先，离线回退） ---------- */
+
+function normalizeRows(arr) {
+  const rows = [];
+  for (let i = 0; i < arr.length; i++) {
+    const r = arr[i];
+    if (!r) continue;
+    const s = Number(r.score);
+    if (!isFinite(s) || s < 0 || s > MAX_SCORE) continue;
+    rows.push({ tag: String(r.tag || ''), name: String(r.name || I18N.t('anonymous')).slice(0, 16), score: s, t: Number(r.t) || 0 });
+  }
+  rows.sort((a, b) => (b.score - a.score) || (b.t - a.t));
+  return rows.slice(0, MAX_RECORDS);
+}
+
+function fetchTop() {
+  return apiTop().then(normalizeRows, function () { return localTop(); });
+}
+
+function submitScore(name, score) {
+  const nm = String(name || I18N.t('defaultName')).slice(0, 12);
+  const sc = Number(score) || 0;
+  return apiSubmit(nm, sc)
+    .then(function (rec) {
+      /* 云端成功后同步写入本地缓存，保持离线可见 */
+      localAddRec({ tag: rec.tag, name: String(rec.name || nm).slice(0, 12), score: Number(rec.score) || sc, t: Number(rec.t) || Date.now() });
+      return rec;
+    })
+    .catch(function () {
+      /* 云端失败回退本地 */
+      return localAddRec({
+        tag: 'local_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 6),
+        name: nm,
+        score: sc,
+        t: Date.now()
+      });
+    });
 }
 
 /* ---------- 昵称 ---------- */
@@ -78,7 +140,7 @@ function myName() {
   return loadName() || I18N.t('defaultName');
 }
 
-/* ---------- UI（与原版一致，仅去网络） ---------- */
+/* ---------- UI（与原版一致，仅数据源换为云端） ---------- */
 
 const listEl = $('boardList');
 const modal = $('boardModal');
@@ -175,7 +237,7 @@ function pushScore(name, score, viaRetry) {
   submitting = true;
   showRetry(false);
   setMsg(I18N.t('submitting'), '');
-  return addScore(name, score).then((rec) => {
+  return submitScore(name, score).then((rec) => {
     lastSubmitAt = Date.now();
     setMsg(I18N.t('submitted', { name: rec.name || name, score: rec.score || score }), 'good');
     return refreshBoard(score).then(() => true, () => true);
@@ -262,7 +324,7 @@ window.DanaiwaBoard = {
   refresh: refreshBoard,
   onGameOver: onGameOver,
   fetchTop: fetchTop,
-  submitScore: addScore,
+  submitScore: submitScore,
   myName: myName,
   setName: function (n) { saveName(cleanName(n)); paintName(); },
   hasName: function () { return !!loadName(); }
